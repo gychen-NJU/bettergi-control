@@ -2,7 +2,7 @@
 .SYNOPSIS
     BetterGI 状态总览（只读，不修改任何文件）。
 .DESCRIPTION
-    一次性输出：进程、游戏窗口尺寸与 16:9 判断、User\config.json 关键键、
+    一次性输出：进程、锁屏/会话状态（WTSInfoEx）、游戏窗口尺寸与 16:9 判断、User\config.json 关键键、
     User\OneDragon\*.json 摘要、最新日志尾部、task_progress / ExecutionRecords 列表、
     以及触发前的前置检查结论（阻断项）。
 .PARAMETER Root
@@ -33,6 +33,7 @@ $result = [ordered]@{
     gameRunning     = $false
     gamePids        = @()
     gameWindow      = $null
+    session         = $null
     configParseOk   = $false
     config          = [ordered]@{}
     oneDragon       = @()
@@ -58,6 +59,68 @@ $result.bgiRunning = ($bgi.Count -gt 0)
 $result.bgiPids = @($bgi | ForEach-Object { $_.Id })
 $result.gameRunning = ($game.Count -gt 0)
 $result.gamePids = @($game | ForEach-Object { $_.Id })
+
+# ---------- 1.5 锁屏 / 会话探测（WTSInfoEx） ----------
+# 为什么必须有这段：锁屏或 Session 0（SSH/服务会话）下，SendInput 与截图会被系统整体吞掉
+# 且不报任何错 —— 前置检查会"✓ 通过"然后任务静默白跑（2026-11-17 ZMAL-PC 全链路实测）。
+# 实测口径（别凭直觉改）：
+#   · WTSInfoEx 布局：Level@0 / SessionId@8 / SessionState@12 / SessionFlags@16（本机 bytes=232，
+#     即 union 8 字节对齐的"布局B"；按 4/8/12 读是布局A，会整体错位 4 字节——已踩过坑）
+#   · SessionFlags：0 = LOCK（锁屏）/ 1 = UNLOCK —— 0 是锁、1 是开，与直觉相反
+#   · WTS_CURRENT_SESSION 必须传 -1；传 0 是"显式查 Session 0"，在交互会话里会读回错误会话的数据
+#   · 必须校验读回的 SessionId@8 == 本进程 SessionId，不符即按"未知"处理（防偏移漂移误判）
+#   · 锁屏时前台进程是 LockApp 而不是 LogonUI（锁屏界面由 LockApp 画，LogonUI 进程数会骗人），
+#     所以这里不数 LogonUI，只信 SessionFlags
+$procSid = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+$session = [ordered]@{
+    sessionId       = $procSid
+    userInteractive = [Environment]::UserInteractive
+    state           = $null
+    stateName       = $null
+    flags           = $null
+    locked          = $null   # $true/$false=已判定；$null=探测失败（消费方应按"未知"给警告，别当"没锁"）
+    known           = $false
+    source          = 'WTSInfoEx'
+}
+try {
+    if (-not ('BgiAgentSessionUtil' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class BgiAgentSessionUtil {
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    public static extern int WTSQuerySessionInformation(IntPtr hServer, int sessionId, int infoClass, out IntPtr ppBuffer, out int pBytesReturned);
+    [DllImport("wtsapi32.dll")]
+    public static extern void WTSFreeMemory(IntPtr pMemory);
+}
+'@ -ErrorAction Stop
+    }
+    $buf = [IntPtr]::Zero
+    $len = 0
+    # hServer=IntPtr.Zero(WTS_CURRENT_SERVER_HANDLE)  sessionId=-1(WTS_CURRENT_SESSION)  infoClass=25(WTSInfoEx)
+    if ([BgiAgentSessionUtil]::WTSQuerySessionInformation([IntPtr]::Zero, -1, 25, [ref]$buf, [ref]$len) -ne 0 -and $buf -ne [IntPtr]::Zero) {
+        try {
+            $sid   = [System.Runtime.InteropServices.Marshal]::ReadInt32($buf, 8)
+            $state = [System.Runtime.InteropServices.Marshal]::ReadInt32($buf, 12)
+            $flags = [System.Runtime.InteropServices.Marshal]::ReadInt32($buf, 16)
+            if ($len -ge 20 -and $sid -eq $procSid) {
+                $stateNames = @('Active','Connected','ConnectQuery','Shadow','Disconnected','Idle','Listen','Reset','Down','Init')
+                $session.state     = $state
+                $session.stateName = if ($state -ge 0 -and $state -lt $stateNames.Count) { $stateNames[$state] } else { "Unknown($state)" }
+                $session.flags     = $flags
+                $session.locked    = ($flags -eq 0)   # 0=WTS_SESSIONSTATE_LOCK
+                $session.known     = $true
+            } else {
+                $result.warnings += "WTSInfoEx 校验失败（读回 SessionId=$sid，本进程=$procSid，len=$len）→ 结构体偏移可能已变化，锁屏状态按未知处理"
+            }
+        } finally { [BgiAgentSessionUtil]::WTSFreeMemory($buf) }
+    } else {
+        $result.warnings += "WTSQuerySessionInformation(WTSInfoEx) 失败 win32=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) → 锁屏状态未知"
+    }
+} catch {
+    $result.warnings += "锁屏/会话探测异常: $($_.Exception.Message) → 锁屏状态未知"
+}
+$result.session = $session
 
 # ---------- 2. 游戏窗口（客户区尺寸） ----------
 if ($result.gameRunning) {
@@ -234,8 +297,22 @@ if (Test-Path -LiteralPath $exDir) {
 }
 
 # ---------- 6. 前置检查（阻断项） ----------
+if ($result.session) {
+    if ($result.session.known -and $result.session.locked) {
+        $result.blockers += '屏幕已锁定（WTSInfoEx SessionFlags=0=LOCK）：SendInput/截图会被系统整体吞掉且不报错，自动化会静默白跑 → 先解锁屏幕'
+    }
+    if ($result.session.sessionId -eq 0) {
+        $result.blockers += '当前是 Session 0（服务/SSH 会话）：没有桌面输入权限（实测 SendInput err=1459/err=5）→ 需经计划任务 /IT 进交互会话再跑'
+    }
+    if (-not $result.session.known) {
+        $result.warnings += '锁屏状态无法判定（WTSInfoEx 探测失败）→ 无人值守跑之前请人工确认屏幕已解锁'
+    }
+}
 if ($result.bgiRunning) {
-    $result.blockers += "BetterGI 正在运行（PID $($result.bgiPids -join ','))：可以触发任务，但**改配置类操作必须先让用户退出程序**"
+    # 2026-11-19 更正：旧文案「可以触发任务」与实测不符 —— 残留实例会把命令行参数整个吞掉
+    # （HomePageViewModel.HandleActivation 只认 start，同秒 EXIT=0、任务不执行）。与 MCP 侧
+    # run-gate.mjs 的硬阻断口径对齐：要跑任务先退出它，改配置同样必须先退出。
+    $result.blockers += "BetterGI 正在运行（PID $($result.bgiPids -join ','))：命令行触发只会被残留实例转发吞掉、不会真正执行（实测同秒 EXIT=0）→ 先退出它（或 bgi_close），改配置类操作同样必须先退出"
 }
 if ($result.configParseOk -and $result.config.captureMode -and $result.config.captureMode -ne 'BitBlt') {
     $result.warnings += "captureMode=$($result.config.captureMode)（不是 BitBlt）：地图追踪/部分识别会表现异常"
@@ -256,6 +333,10 @@ if ($Json) {
 } else {
     "=== BetterGI 状态（$Root） ==="
     "进程        : BetterGI=$(if ($result.bgiRunning) { "运行中 PID $($result.bgiPids -join ',')" } else { '未运行' })  原神=$(if ($result.gameRunning) { "运行中 PID $($result.gamePids -join ',')" } else { '未运行' })"
+    if ($result.session) {
+        $lockTxt = if (-not $result.session.known) { '未知（探测失败）' } elseif ($result.session.locked) { '已锁定 ⛔' } else { '未锁定' }
+        "会话        : SessionId=$($result.session.sessionId)$(if ($result.session.sessionId -eq 0) { '（Session 0，无桌面输入 ⛔）' })  锁屏=$lockTxt  状态=$($result.session.stateName)  交互=$($result.session.userInteractive)"
+    }
     if ($result.gameWindow) {
         "游戏窗口    : $($result.gameWindow.clientWidth)x$($result.gameWindow.clientHeight)  16:9=$($result.gameWindow.is169)  ≥1080P=$($result.gameWindow.atLeast1080p)  最小化=$($result.gameWindow.minimized)  前台=$($result.gameWindow.foreground)  可跑=$($result.gameWindow.readyForTask)"
         if (-not $result.gameWindow.foreground) { "  当前前台窗口: $($result.gameWindow.foregroundTitle)（自动化要求原神保持前台，否则任务会暂停）" }
